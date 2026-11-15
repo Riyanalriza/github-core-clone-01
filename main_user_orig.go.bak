@@ -1,0 +1,513 @@
+package main
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	_ "modernc.org/sqlite"
+)
+
+var (
+	baseDir  = envOr("FORGE_DATA", "./data")
+	reposDir = filepath.Join(baseDir, "repos")
+	dbPath   = filepath.Join(baseDir, "meta.db")
+	db       *sql.DB
+)
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+// ---------- DB ----------
+func initDB() {
+	os.MkdirAll(reposDir, 0755)
+	var err error
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, login TEXT UNIQUE, token TEXT);
+	CREATE TABLE IF NOT EXISTS repos(owner TEXT, name TEXT, description TEXT, private INTEGER DEFAULT 0, PRIMARY KEY(owner,name));
+	CREATE TABLE IF NOT EXISTS issues(id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, repo TEXT, number INTEGER, title TEXT, body TEXT, state TEXT DEFAULT 'open', labels TEXT DEFAULT '[]');
+	CREATE TABLE IF NOT EXISTS pulls(id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, repo TEXT, number INTEGER, title TEXT, head TEXT, base TEXT, state TEXT DEFAULT 'open');
+	INSERT OR IGNORE INTO users VALUES('1','admin','token-admin-123');
+	`)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func auth(r *http.Request) (string, bool) {
+	tok := r.Header.Get("Authorization")
+	tok = strings.TrimPrefix(tok, "Bearer ")
+	tok = strings.TrimPrefix(tok, "token ")
+	if tok == "" {
+		return "anonymous", true
+	}
+	var login string
+	err := db.QueryRow("SELECT login FROM users WHERE token=?", tok).Scan(&login)
+	if err != nil {
+		return "", false
+	}
+	return login, true
+}
+
+func repoPath(owner, name string) string {
+	name = strings.TrimSuffix(name, ".git")
+	// cegah path traversal
+	if strings.Contains(owner, "..") || strings.Contains(name, "..") ||
+		strings.Contains(owner, "/") || strings.Contains(name, "/") {
+		return ""
+	}
+	return filepath.Join(reposDir, owner, name+".git")
+}
+
+func ensureRepo(owner, name string) string {
+	p := repoPath(owner, name)
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		os.MkdirAll(p, 0755)
+		cmd := exec.Command("git", "init", "--bare", p)
+		cmd.Run()
+		os.WriteFile(filepath.Join(p, "git-daemon-export-ok"), []byte{}, 0644)
+	}
+	return p
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+// ---------- GIT SMART HTTP ----------
+// Kunci kompatibilitas: kita tidak implementasi ulang protokol git,
+// kita delegasikan ke git http-backend resmi.
+func gitSmartHTTP(w http.ResponseWriter, r *http.Request) {
+	// Path: /{owner}/{repo}.git/info/refs atau /{owner}/{repo}.git/git-upload-pack
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 2 {
+		http.NotFound(w, r)
+		return
+	}
+	owner := parts[0]
+	repo := strings.TrimSuffix(parts[1], ".git")
+	service := ""
+	if len(parts) >= 3 {
+		service = parts[2]
+	}
+	if service == "info" {
+		// /info/refs?service=...
+		service = r.URL.Query().Get("service")
+		// untuk info/refs, path info ada di parts[2]=info, parts[3]=refs
+		// kita reconstruct PATH_INFO
+	}
+	ensureRepo(owner, repo)
+
+	body, _ := io.ReadAll(r.Body)
+	env := append(os.Environ(),
+		"GIT_PROJECT_ROOT="+reposDir,
+		"GIT_HTTP_EXPORT_ALL=1",
+		"PATH_INFO=/"+owner+"/"+repo+".git/"+strings.Join(parts[2:], "/"),
+		"QUERY_STRING="+r.URL.RawQuery,
+		"REQUEST_METHOD="+r.Method,
+		"CONTENT_TYPE="+r.Header.Get("Content-Type"),
+		fmt.Sprintf("CONTENT_LENGTH=%d", len(body)),
+		"REMOTE_USER=admin",
+	)
+	// Untuk info/refs, PATH_INFO harus /owner/repo.git/info/refs
+	if strings.Contains(r.URL.Path, "/info/refs") {
+		env = append(env, "PATH_INFO=/"+owner+"/"+repo+".git/info/refs")
+	}
+	if strings.Contains(r.URL.Path, "git-upload-pack") {
+		env = append(env, "PATH_INFO=/"+owner+"/"+repo+".git/git-upload-pack")
+	}
+	if strings.Contains(r.URL.Path, "git-receive-pack") {
+		env = append(env, "PATH_INFO=/"+owner+"/"+repo+".git/git-receive-pack")
+	}
+
+	cmd := exec.Command("git", "http-backend")
+	cmd.Env = env
+	cmd.Stdin = bytes.NewReader(body)
+	out, err := cmd.Output()
+	if err != nil {
+		// git http-backend kadang exit non-zero tapi tetap output
+		if len(out) == 0 {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
+	// Pisah header dan body dari output http-backend
+	idx := bytes.Index(out, []byte("\r\n\r\n"))
+	if idx == -1 {
+		w.Write(out)
+		return
+	}
+	headerRaw := string(out[:idx])
+	payload := out[idx+4:]
+	for _, line := range strings.Split(headerRaw, "\r\n") {
+		if strings.Contains(line, ":") {
+			kv := strings.SplitN(line, ":", 2)
+			k := strings.TrimSpace(kv[0])
+			v := strings.TrimSpace(kv[1])
+			if strings.EqualFold(k, "Status") {
+				// contoh: "Status: 200 OK"
+				continue
+			}
+			w.Header().Set(k, v)
+		}
+	}
+	w.Write(payload)
+}
+
+// ---------- REST v3 ----------
+type RepoCreate struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Private     bool   `json:"private"`
+}
+
+func handleCreateRepo(w http.ResponseWriter, r *http.Request) {
+	login, ok := auth(r)
+	if !ok {
+		http.Error(w, `{"message":"Bad credentials"}`, 401)
+		return
+	}
+	var in RepoCreate
+	json.NewDecoder(r.Body).Decode(&in)
+	if in.Name == "" {
+		http.Error(w, `{"message":"name required"}`, 422)
+		return
+	}
+	ensureRepo(login, in.Name)
+	db.Exec("INSERT OR REPLACE INTO repos VALUES(?,?,?,?)", login, in.Name, in.Description, boolToInt(in.Private))
+	writeJSON(w, 201, map[string]any{
+		"name": in.Name, "full_name": login + "/" + in.Name,
+		"owner": map[string]any{"login": login},
+		"description": in.Description, "private": in.Private,
+		"clone_url": fmt.Sprintf("http://%s/%s/%s.git", r.Host, login, in.Name),
+		"default_branch": "main",
+	})
+}
+
+func handleGetRepo(w http.ResponseWriter, r *http.Request, owner, repo string) {
+	var desc string
+	var priv int
+	err := db.QueryRow("SELECT description, private FROM repos WHERE owner=? AND name=?", owner, repo).Scan(&desc, &priv)
+	if err != nil {
+		http.Error(w, `{"message":"Not Found"}`, 404)
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"name": repo, "full_name": owner + "/" + repo,
+		"owner": map[string]any{"login": owner},
+		"description": desc, "private": priv == 1,
+		"clone_url": fmt.Sprintf("http://%s/%s/%s.git", r.Host, owner, repo),
+	})
+}
+
+func handleListCommits(w http.ResponseWriter, r *http.Request, owner, repo string) {
+	p := repoPath(owner, repo)
+	cmd := exec.Command("git", "--git-dir", p, "log", "--pretty=format:%H|%an|%s|%ad", "-n", "20")
+	out, _ := cmd.Output()
+	var list []map[string]any
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		list = append(list, map[string]any{
+			"sha": parts[0],
+			"commit": map[string]any{"author": map[string]any{"name": parts[1], "date": parts[3]}, "message": parts[2]},
+			"author": map[string]any{"login": parts[1]},
+		})
+	}
+	if list == nil {
+		list = []map[string]any{}
+	}
+	writeJSON(w, 200, list)
+}
+
+func handleIssues(w http.ResponseWriter, r *http.Request, owner, repo string) {
+	if r.Method == "POST" {
+		login, ok := auth(r)
+		if !ok {
+			http.Error(w, `{"message":"Bad credentials"}`, 401)
+			return
+		}
+		_ = login
+		var in struct {
+			Title  string   `json:"title"`
+			Body   string   `json:"body"`
+			Labels []string `json:"labels"`
+		}
+		json.NewDecoder(r.Body).Decode(&in)
+		var n int
+		db.QueryRow("SELECT COUNT(*)+1 FROM issues WHERE owner=? AND repo=?", owner, repo).Scan(&n)
+		labelsJSON, _ := json.Marshal(in.Labels)
+		db.Exec("INSERT INTO issues(owner,repo,number,title,body,labels) VALUES(?,?,?,?,?,?)", owner, repo, n, in.Title, in.Body, string(labelsJSON))
+		writeJSON(w, 201, map[string]any{"id": n, "number": n, "title": in.Title, "body": in.Body, "state": "open", "labels": in.Labels})
+		return
+	}
+	// GET
+	rows, _ := db.Query("SELECT number,title,body,state,labels FROM issues WHERE owner=? AND repo=?", owner, repo)
+	defer rows.Close()
+	var list []map[string]any
+	for rows.Next() {
+		var num int
+		var title, body, state, labelsStr string
+		rows.Scan(&num, &title, &body, &state, &labelsStr)
+		var labels []string
+		json.Unmarshal([]byte(labelsStr), &labels)
+		list = append(list, map[string]any{"number": num, "title": title, "body": body, "state": state, "labels": labels})
+	}
+	if list == nil {
+		list = []map[string]any{}
+	}
+	writeJSON(w, 200, list)
+}
+
+func handleContent(w http.ResponseWriter, r *http.Request, owner, repo, path string) {
+	p := repoPath(owner, repo)
+	ref := r.URL.Query().Get("ref")
+	if ref == "" {
+		ref = "HEAD"
+	}
+	cmd := exec.Command("git", "--git-dir", p, "show", ref+":"+path)
+	out, err := cmd.Output()
+	if err != nil {
+		http.Error(w, `{"message":"Not Found"}`, 404)
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"name": filepath.Base(path), "path": path, "type": "file",
+		"content": base64.StdEncoding.EncodeToString(out), "encoding": "base64", "sha": ref,
+	})
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// ---------- GRAPHQL (minimal, kompatibel query dasar GitHub) ----------
+func handleGraphQL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Query string `json:"query"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	q := req.Query
+
+	// Parse sederhana: repository(owner:"x", name:"y"){ fullName description }
+	// Kita tidak pakai parser full GraphQL, tapi cukup untuk client yang kirim query standar
+	// Ambil owner & name dari string query
+	owner := extractArg(q, "owner")
+	name := extractArg(q, "name")
+
+	// Jika query issues
+	if strings.Contains(q, "issues") {
+		rows, _ := db.Query("SELECT number,title,body,state FROM issues WHERE owner=? AND repo=?", owner, name)
+		defer rows.Close()
+		var issues []map[string]any
+		for rows.Next() {
+			var num int
+			var title, body, state string
+			rows.Scan(&num, &title, &body, &state)
+			issues = append(issues, map[string]any{"number": num, "title": title, "body": body, "state": state})
+		}
+		writeJSON(w, 200, map[string]any{"data": map[string]any{"repository": map[string]any{"issues": issues}}})
+		return
+	}
+
+	var desc string
+	var priv int
+	err := db.QueryRow("SELECT description, private FROM repos WHERE owner=? AND name=?", owner, name).Scan(&desc, &priv)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"data": map[string]any{"repository": nil}})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"data": map[string]any{"repository": map[string]any{
+		"name": name, "owner": owner, "fullName": owner + "/" + name, "description": desc,
+	}}})
+}
+
+func extractArg(q, key string) string {
+	// cari key:"value" atau key: "value"
+	idx := strings.Index(q, key)
+	if idx == -1 {
+		return ""
+	}
+	rest := q[idx+len(key):]
+	// cari " pertama
+	s := strings.Index(rest, `"`)
+	if s == -1 {
+		return ""
+	}
+	e := strings.Index(rest[s+1:], `"`)
+	if e == -1 {
+		return ""
+	}
+	return rest[s+1 : s+1+e]
+}
+
+// ---------- MCP (JSON-RPC 2.0, Streamable HTTP) ----------
+func handleMCP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      any    `json:"id"`
+		Method  string `json:"method"`
+		Params  struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"params"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	json.Unmarshal(body, &req)
+
+	// initialize
+	if req.Method == "initialize" {
+		writeJSON(w, 200, map[string]any{
+			"jsonrpc": "2.0", "id": req.ID,
+			"result": map[string]any{
+				"protocolVersion": "2024-11-05",
+				"serverInfo":      map[string]any{"name": "forge", "version": "1.0.0"},
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+			},
+		})
+		return
+	}
+	if req.Method == "tools/list" {
+		writeJSON(w, 200, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"tools": []map[string]any{
+			{"name": "list_repos", "description": "List repos by owner", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"owner": map[string]any{"type": "string"}}}},
+			{"name": "create_issue", "description": "Create issue", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"owner": map[string]any{"type": "string"}, "repo": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"}}}},
+			{"name": "get_file", "description": "Get file content", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"owner": map[string]any{"type": "string"}, "repo": map[string]any{"type": "string"}, "path": map[string]any{"type": "string"}}}},
+		}}})
+		return
+	}
+	if req.Method == "tools/call" {
+		var resultText string
+		switch req.Params.Name {
+		case "list_repos":
+			owner := fmt.Sprint(req.Params.Arguments["owner"])
+			rows, _ := db.Query("SELECT owner,name,description FROM repos WHERE owner=?", owner)
+			defer rows.Close()
+			var arr []map[string]any
+			for rows.Next() {
+				var o, n, d string
+				rows.Scan(&o, &n, &d)
+				arr = append(arr, map[string]any{"owner": o, "name": n, "description": d})
+			}
+			b, _ := json.Marshal(arr)
+			resultText = string(b)
+		case "create_issue":
+			owner := fmt.Sprint(req.Params.Arguments["owner"])
+			repo := fmt.Sprint(req.Params.Arguments["repo"])
+			title := fmt.Sprint(req.Params.Arguments["title"])
+			var n int
+			db.QueryRow("SELECT COUNT(*)+1 FROM issues WHERE owner=? AND repo=?", owner, repo).Scan(&n)
+			db.Exec("INSERT INTO issues(owner,repo,number,title) VALUES(?,?,?,?)", owner, repo, n, title)
+			resultText = fmt.Sprintf("Issue #%d created", n)
+		case "get_file":
+			owner := fmt.Sprint(req.Params.Arguments["owner"])
+			repo := fmt.Sprint(req.Params.Arguments["repo"])
+			path := fmt.Sprint(req.Params.Arguments["path"])
+			p := repoPath(owner, repo)
+			out, err := exec.Command("git", "--git-dir", p, "show", "HEAD:"+path).Output()
+			if err != nil {
+				resultText = "Not found"
+			} else {
+				resultText = string(out)
+			}
+		}
+		writeJSON(w, 200, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"content": []map[string]any{{"type": "text", "text": resultText}}}})
+		return
+	}
+	// notifications / ping
+	writeJSON(w, 200, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{}})
+}
+
+// ---------- ROUTER ----------
+func main() {
+	initDB()
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"status": "ok", "protocols": []string{"git-smart-http", "rest-v3", "graphql", "mcp"}})
+	})
+
+	mux.HandleFunc("/api/v3/user/repos", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			handleCreateRepo(w, r)
+			return
+		}
+		http.Error(w, "method not allowed", 405)
+	})
+
+	mux.HandleFunc("/graphql", handleGraphQL)
+	mux.HandleFunc("/mcp", handleMCP)
+
+	// REST + Git - catch-all
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.Trim(r.URL.Path, "/")
+		parts := strings.Split(path, "/")
+
+		// Git Smart HTTP: /{owner}/{repo}.git/...
+		if len(parts) >= 2 && (strings.Contains(r.URL.Path, ".git/") || strings.HasSuffix(r.URL.Path, ".git")) {
+			// normalisasi: jika path /owner/repo.git, parts[1] sudah .git
+			// tapi untuk /owner/repo/info/refs tanpa .git juga handle
+			gitSmartHTTP(w, r)
+			return
+		}
+		if len(parts) >= 2 && (strings.Contains(r.URL.Path, "/info/refs") || strings.Contains(r.URL.Path, "git-upload-pack") || strings.Contains(r.URL.Path, "git-receive-pack")) {
+			gitSmartHTTP(w, r)
+			return
+		}
+
+		// REST: /api/v3/repos/{owner}/{repo}/...
+		if len(parts) >= 4 && parts[0] == "api" && parts[1] == "v3" && parts[2] == "repos" {
+			owner := parts[3]
+			repo := parts[4]
+			rest := ""
+			if len(parts) > 5 {
+				rest = strings.Join(parts[5:], "/")
+			}
+			switch {
+			case rest == "":
+				handleGetRepo(w, r, owner, repo)
+			case rest == "commits":
+				handleListCommits(w, r, owner, repo)
+			case rest == "issues":
+				handleIssues(w, r, owner, repo)
+			case strings.HasPrefix(rest, "contents/"):
+				handleContent(w, r, owner, repo, strings.TrimPrefix(rest, "contents/"))
+			default:
+				http.NotFound(w, r)
+			}
+			return
+		}
+
+		http.NotFound(w, r)
+	})
+
+	port := envOr("PORT", "8000")
+	log.Printf("Forge running on :%s data=%s", port, baseDir)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
